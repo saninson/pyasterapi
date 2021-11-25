@@ -1,10 +1,11 @@
 from enum import unique
-from flask import Flask, jsonify, abort, request, make_response, url_for, Response
+from os import stat
+from flask import Flask, json, jsonify, abort, request, make_response, url_for, Response, send_from_directory
 import asterisk.manager as astman
 import sys
 import re
 import pymysql
-from datetime import datetime
+import datetime
 
 app = Flask(__name__, static_url_path = "")
 
@@ -38,7 +39,8 @@ def man_get_queues_summary():
                 'holdtime': int(re.findall(r'Holdtime:\W(\d+)\r\n', event)[0]),
                 'talktime': int(re.findall(r'TalkTime:\W(\d+)\r\n', event)[0]),
                 'completed': int(re.findall(r'Completed:\W(\d+)\r\n', event)[0]),
-                'calls': int(re.findall(r'Calls:\W(\d+)\r\n', event)[0]),
+                'calls': int(re.findall(r'Calls:\W(\d+)\r\n', event)[0]),  # calls in queue
+                'calls_connected': 0,                                      # current connected calls
                 'paused': 0,
                 'online': 0,
                 'ready': 0,
@@ -61,8 +63,11 @@ def man_get_queues_summary():
                     '7': 'ring_in_use',
                     '8': 'on_hold'}.get(re.findall(r'Status:\W(\d+)\r\n', event)[0]),
                 'incall': {'1': 'yes', '0': 'no'}.get(re.findall(r'InCall:\W(\d+)\r\n', event)[0]),
-                'lastcall': datetime.utcfromtimestamp(int(re.findall(r'LastCall:\W(\d+)\r\n', event)[0])),
+                'lastcall': datetime.datetime.utcfromtimestamp(int(re.findall(r'LastCall:\W(\d+)\r\n', event)[0])),
             }
+            # count calls connected 
+            if summary[q_name]['agents'][member_name]['incall'] == 'yes':
+                summary[q_name]['calls_connected'] += 1
             # count paused
             if summary[q_name]['agents'][member_name]['paused'] == 'yes':
                 summary[q_name]['paused'] += 1
@@ -74,10 +79,11 @@ def man_get_queues_summary():
                     summary[q_name]['ready'] += 1 
 
     return summary
-    
+
 
 @app.route(f'{ROOT_URI}/status', methods = ['GET'])
 def get_status():
+    # TODO
     data = {
         'status': 'ok',
         'version': '0.0.1',
@@ -88,16 +94,14 @@ def get_status():
 
 @app.route(f'{ROOT_URI}/queues/brief', methods = ['GET'])
 def get_queues():
-    man_get_queues_summary()
     try:
         data = {
-            'status': 'ok',
-            'queues': man_get_queues_summary(),
+            "queues": man_get_queues_summary(),
+            "debug_info": 2146,
         }
     except:
-        data = {
-            'status': 'false',
-        }
+        abort(404)
+
     return jsonify(data)
 
 
@@ -113,7 +117,7 @@ def db_select(query):
 
 
 @app.route("/mp3/<float:uniqueid>")
-def stream_mp3(uniqueid):
+def get_mp3(uniqueid):
     # find file name in db
     ok, res =  db_select(
         query = (
@@ -130,16 +134,218 @@ def stream_mp3(uniqueid):
     month = f"0{dt.month}"[-2:]
     day = f"0{dt.day}"[-2:]
     # buld file path using record creation date
-    mp3path = f"{RECORDS_ROOT}/{dt.year}/{month}/{day}/{row[0]}"
+    mp3directory = f"{RECORDS_ROOT}/{dt.year}/{month}/{day}"
+    mp3name = f"{row[0]}"
+    return send_from_directory(mp3directory, mp3name)
 
-    def generate():
-        with open(mp3path, "rb") as fmp3:
-            data = fmp3.read(1024)
-            while data:
-                yield data
-                data = fmp3.read(1024)
-    return Response(generate(), mimetype="audio/mpeg")
 
+def toDateTime(dateString): 
+    # return datetime.datetime.strptime(dateString, "%Y-%m-%d").date()
+    # TODO
+    return dateString
+
+
+@app.route(f'{ROOT_URI}/agent/history', methods = ['GET'])
+def get_agent_history():
+    data = {
+        "result": False,
+        "history": {},
+    }
+    try:
+        dtfrom = request.args.get('dtfrom', default = datetime.date.today(), type = toDateTime)
+        dtto = request.args.get('dtto', default = datetime.date.today(), type = toDateTime)
+        agent_name = request.args.get('agent')
+        
+        # agent statuses history
+        # debug
+        # dtfrom = "2021-09-15T00:00:00"
+        # dtto = "2021-09-15T23:00:00"
+        # agent_name = "0006"
+
+        ok, res = db_select(
+            query=(
+                "SELECT * "
+                "FROM agent_status_history "
+                f"WHERE (timestamp BETWEEN '{dtfrom}' AND '{dtto}') "
+                f"AND agentId = 'SIP/{agent_name}' "
+            )
+        )
+
+
+        if ok:
+            data["result"] = True
+            data["row_count"] = len(res)
+            for row in res: 
+                data["history"].update(
+                    {row[0]: {
+                            "timestamp": row[3],
+                            "status": row[2],
+                            "queue": row[4], 
+                        }
+                    }
+                )
+
+    except:
+        abort(404)
+
+    return jsonify(data)
+
+
+@app.route(f'{ROOT_URI}/stat/totals', methods = ['GET'])
+def get_stat_totals():
+    data = {
+        "stat": {},
+    }
+    try:
+        dtfrom = request.args.get('dtfrom', default=f"{datetime.date.today()} 00:00:00", type=toDateTime)
+        dtto = request.args.get('dtto', default=f"{datetime.date.today()} 23:59:59", type=toDateTime)
+        queue_name = request.args.get('queue', default = '%',)
+        get_rate = request.args.get('get_rate', default='no')
+        get_lostafter = request.args.get('lostafter', default=0, type=int)
+
+        # total received
+        # dtfrom="2021-08-18T00:00:00"
+        # dtto="2021-08-18T23:00:00"
+        ok, res = db_select(
+            query=(
+                " SELECT count(*) "
+                " FROM queue_log "
+                f" WHERE (time BETWEEN '{dtfrom}' AND '{dtto}') "
+                f" AND (queuename like '{queue_name}') "
+                " AND EVENT = 'ENTERQUEUE' "
+            )
+        )
+        if not ok:
+            abort(404)
+        data["stat"]["received"] = res[0][0]
+        
+        # total answered & avg(wait)
+        ok, res = db_select(
+            query=(
+                " SELECT count(*), avg(data1) "
+                " FROM queue_log "
+                f" WHERE (time BETWEEN '{dtfrom}' AND '{dtto}') "
+                f" AND (queuename like '{queue_name}') "
+                " AND event = 'CONNECT' "
+            )
+        )
+        if not ok:
+            abort(404)
+        data["stat"]["answered"] = res[0][0]
+        data["stat"]["avg_wait"] = res[0][1]
+
+        # rating
+        if get_rate == 'yes':
+            ok, res = db_select(
+                query=(
+                    " SELECT count(*), avg(data1) "
+                    " FROM queue_log "
+                    f" WHERE (time BETWEEN '{dtfrom}' AND '{dtto}') "
+                    f" AND (queuename like '{queue_name}') "
+                    " AND event = 'RATE' "
+                    " AND data1 != '0' "
+                )
+            )
+            if not ok:
+                abort(404)
+            data["stat"]["rate_count"] = res[0][0]
+            data["stat"]["avg_rate"] = res[0][1]
+
+        # lost after 40 sec waiting
+        if get_lostafter > 0:
+            ok, res = db_select(
+                query=(
+                    " SELECT count(*) "
+                    " FROM queue_log "
+                    f" WHERE (time BETWEEN '{dtfrom}' AND '{dtto}') "
+                    " AND EVENT = 'ABANDON'"
+                    " AND AGENT = 'NONE' "
+                    f" AND data3 >= {get_lostafter}; "
+                )
+            )
+            if not ok:
+                abort(404)
+            data["stat"]["lostafter"] = res[0][0]
+
+        # total lost
+        data["stat"]["lost"] = data["stat"]["received"] - data["stat"]["answered"]
+        
+    except:
+        abort(404)
+
+    return jsonify(data)
+
+
+@app.route(f'{ROOT_URI}/stat/rate', methods = ['GET'])
+def get_stat_rate():
+    try:
+        dtfrom = request.args.get('dtfrom', default=f"{datetime.date.today()} 00:00:00", type=toDateTime)
+        dtto = request.args.get('dtto', default=f"{datetime.date.today()} 23:59:59", type=toDateTime)
+        queue_name = request.args.get('queue', default = '%',)
+
+        
+        ok, data = db_select(
+            query=(
+                " SELECT t1.time, t1.queuename, t1.agent, t1.data1 as rate, t2.data2 as callerid "
+                " FROM queue_log as t1 "
+                " JOIN queue_log as t2 "
+                " ON t1.callid = t2.callid "
+                " WHERE  t2.event = 'ENTERQUEUE' "
+                f" AND t1.queuename like '{queue_name}' "
+                " AND t1.event = 'RATE' "
+                f" AND t1.time BETWEEN '{dtfrom}' AND '{dtto}' ;"
+            )
+        )
+        if not ok:
+            abort(404)
+        
+    except:
+        abort(404)
+
+    return jsonify(data)
     
+
+@app.route(f'{ROOT_URI}/agent/pause/<string:agent_name>', methods = ['GET', 'POST'])
+def agent_pause(agent_name):
+    data = {
+        'result': False,
+        'agent': agent_name,
+    }
+    if request.method == 'GET':
+        summary = man_get_queues_summary()
+        agent_queues = []
+        data['paused_queues'] = []
+        for q_name, q_info in summary.items():
+            if agent_name in q_info['agents'].keys():
+                agent_queues.append(q_name)
+                if q_info['agents'][agent_name]['paused'] == 'yes':
+                    data['paused_queues'].append(q_name)
+
+        if agent_queues:
+            data['result'] = True
+            data['paused'] = {True: 'yes', False: 'no'}.get(len(data['paused_queues']) > 0)
+            
+        return jsonify(data)
+    
+    # POST
+    try:
+        if not request.form['paused'] in ['yes', 'no']:
+            raise
+        action = {
+            'Action':'QueuePause',
+            'Interface': f'SIP/{agent_name}',
+            'Paused': {'yes': 'true', 'no': 'false'}.get(request.form['paused']),
+        }
+        if 'queue' in request.form.keys():
+            action['Queue': request.form['queue']]
+
+        res = manager.send_action(action)
+        data['result'] = res.headers['Response'] == 'Success'
+        data['msg'] = res.headers['Message']
+    except:
+        print(sys.exc_info())
+
+    return jsonify(data)
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug = True)
+    app.run(host='0.0.0.0', port=6412, debug = True)
