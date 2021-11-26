@@ -6,6 +6,7 @@ import sys
 import re
 import pymysql
 import datetime
+import time
 
 app = Flask(__name__, static_url_path = "")
 
@@ -284,7 +285,7 @@ def get_stat_rate():
         queue_name = request.args.get('queue', default = '%',)
 
         
-        ok, data = db_select(
+        ok, res = db_select(
             query=(
                 " SELECT t1.time, t1.queuename, t1.agent, t1.data1 as rate, t2.data2 as callerid "
                 " FROM queue_log as t1 "
@@ -296,14 +297,196 @@ def get_stat_rate():
                 f" AND t1.time BETWEEN '{dtfrom}' AND '{dtto}' ;"
             )
         )
+
         if not ok:
             abort(404)
+
+        data = []
+        for row in res:
+            row = list(row)
+            row[2] = row[2].split('/')[1]
+            data.append(row)
+
         
     except:
+        print(sys.exc_info())
         abort(404)
 
     return jsonify(data)
     
+
+@app.route(f'{ROOT_URI}/stat/general', methods = ['GET'])
+def get_stat_general():
+    data = {
+        "stat": {},
+        "delay": 0,
+    }
+    ts1 = time.time()
+    try:
+        dtfrom = request.args.get('dtfrom', default=f"{datetime.date.today()} 00:00:00", type=toDateTime)
+        dtto = request.args.get('dtto', default=f"{datetime.date.today()} 23:59:59", type=toDateTime)
+        
+        # dtfrom="2021-08-18T00:00:00"
+        # dtto="2021-08-18T23:00:00"
+
+        ok, agent_list = db_select(
+            query = (
+                "SELECT DISTINCT agent FROM `asterisk`.`queue_log` "
+                " WHERE (event IN ('CONNECT', 'RINGNOANSWER'))"
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+            )
+        )
+        if not ok:
+            abort(404)
+
+        ok, day_list = db_select(
+            query = (
+                "SELECT DISTINCT DATE(time) AS `day` FROM `asterisk`.`queue_log` "
+                " WHERE (event IN ('CONNECT', 'RINGNOANSWER'))"
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+            )
+        )
+        if not ok:
+            abort(404)
+
+        # init dict with days and agents
+        for t1_row in day_list:
+            day = t1_row[0].strftime("%d-%m-%Y")
+            data["stat"][day] = {}
+            for t2_row in agent_list:
+                agent = t2_row[0].split("/")[1]
+                data["stat"][day][agent] = {
+                    "sent": 0,
+                    "accepted": 0,
+                    "missed": 0,
+                    "avg_rate": 0,
+                    "talk_time": 0,
+                    "avg_hold": 0,
+                    "wrapup_time": 0,
+                    "wrapup_per_call": 0,
+                    "work_time": 0,
+                }
+
+        # accepted
+        ok, res = db_select(
+            query=(
+                "SELECT DATE(time) as `day`, agent, count(1) as accepted, avg(data1) as avg_hold FROM `asterisk`.`queue_log` "
+                "WHERE (event = 'CONNECT') "
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+                "GROUP BY `day`, agent "
+                "ORDER BY agent, `day`; "
+            )
+        )
+        if not ok:
+            abort(404)
+
+        for row in res:
+            day = row[0].strftime("%d-%m-%Y")
+            agent = row[1].split('/')[1]  # split SIP/0001 to SIP and 0001
+            accept_cnt = row[2]
+            avg_hold = round(row[3])
+            data["stat"][day][agent]["accepted"] = accept_cnt
+            data["stat"][day][agent]["avg_hold"] = avg_hold
+
+        # missed
+        ok, res = db_select(
+            query=(
+                "SELECT DATE(time) as `day`, agent, count(1) as missed FROM `asterisk`.`queue_log`  "
+                "WHERE (event = 'RINGNOANSWER') "
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+                "GROUP BY `day`, agent "
+                "ORDER BY agent, `day` "
+            )
+        )
+        if not ok:
+            abort(404)
+
+        for row in res:
+            day = row[0].strftime("%d-%m-%Y")
+            agent = row[1].split('/')[1]  # split SIP/0001 to SIP and 0001
+            missed_cnt = row[2]
+            data["stat"][day][agent]["missed"] = missed_cnt
+            data["stat"][day][agent]["sent"] = missed_cnt + data["stat"][day][agent]["accepted"]
+
+        # avg rate
+        ok, res = db_select(
+            query=(
+                "SELECT DATE(time) as `day`, agent, AVG(data1) as avgrate FROM `asterisk`.`queue_log`  "
+                "WHERE (event = 'RATE') "
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+                "GROUP BY `day`, agent "
+                "ORDER BY agent, `day` ;"
+            )
+        )
+        if not ok:
+            abort(404)
+
+        for row in res:
+            day = row[0].strftime("%d-%m-%Y")
+            agent = row[1].split('/')[1]  # split SIP/0001 to SIP and 0001
+            avg_rate = row[2]
+            data["stat"][day][agent]["avg_rate"] = round(avg_rate,1)
+
+
+        # talk time
+        ok, res = db_select(
+            query=(
+                "SELECT DATE(time) as `day`, agent, SUM(data2) as talktime FROM `asterisk`.`queue_log`  "
+                "WHERE (event in ('COMPLETEAGENT', 'COMPLETECALLER')) "
+                f"AND (time between '{dtfrom}' and '{dtto}') "
+                "GROUP BY `day`, agent "
+                "ORDER BY agent, `day` "
+            )
+        )
+        if not ok:
+            abort(404)
+
+        for row in res:
+            day = row[0].strftime("%d-%m-%Y")
+            agent = row[1].split('/')[1]  # split SIP/0001 to SIP and 0001
+            talk_time = row[2]
+            data["stat"][day][agent]["talk_time"] = talk_time
+
+
+        # wrapup time (pause between calls)
+        for agent_row in agent_list:
+            agent = agent_row[0].split('/')[1]
+
+            ok, res = db_select(
+                query = (
+                    "SELECT time, DAY(time), agent, event FROM `asterisk`.`queue_log`  "
+                    "WHERE (event in ('CONNECT', 'COMPLETEAGENT', 'COMPLETECALLER')) "
+                    f"AND (agent like '%/{agent}') "
+                    f"AND (time between '{dtfrom}' and '{dtto}') "
+                    "ORDER BY time "
+                )
+            )
+
+            if not ok:
+                abort(404)
+
+            prev = res[0]
+            first = res[0]
+
+            for row in res:
+                if (first[1] != row[1]) or (res.index(row)+1 == len(res)):  # if current is the next day or last record in list
+                    # print(f"agent: {agent}, first: {first[0]}, last: {prev[0]}")
+                    delta = prev[0] - first[0]
+                    day = prev[0].strftime("%d-%m-%Y")   
+                    data["stat"][day][agent]["work_time"] = delta.seconds
+                    data["stat"][day][agent]["wrapup_time"] = data["stat"][day][agent]["work_time"] - data["stat"][day][agent]["talk_time"]
+                    data["stat"][day][agent]["wrapup_per_call"] = round(data["stat"][day][agent]["wrapup_time"] / data["stat"][day][agent]["accepted"])
+                    # prepeare for the next day
+                    first = row
+                prev = row
+                
+    except:
+        print(sys.exc_info())
+        abort(404)
+    data["delay"] = time.time() - ts1
+    
+    return jsonify(data)
+
 
 @app.route(f'{ROOT_URI}/agent/pause/<string:agent_name>', methods = ['GET', 'POST'])
 def agent_pause(agent_name):
